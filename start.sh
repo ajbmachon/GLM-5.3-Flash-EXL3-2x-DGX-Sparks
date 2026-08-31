@@ -63,6 +63,8 @@ _cli_fused="${EXL3_FUSED_MOE-}"
 _cli_row_tile="${EXL3_MOE_ROW_TILE-}"
 _cli_temp_rows="${EXL3_TEMP_ROWS_FUSED-}"
 _cli_mnbt="${MAX_NUM_BATCHED_TOKENS-}"
+_cli_maxlen="${MAX_MODEL_LEN-}"
+_cli_dft="${DFLASH_TOKENS-}"
 _cli_image="${IMAGE-}"
 _cli_util="${GPU_MEM_UTIL-}"
 _cli_lm="${LANGUAGE_MODEL_ONLY-}"
@@ -84,6 +86,8 @@ set +a
 [ -n "${_cli_row_tile}" ] && EXL3_MOE_ROW_TILE="$_cli_row_tile"
 [ -n "${_cli_temp_rows}" ] && EXL3_TEMP_ROWS_FUSED="$_cli_temp_rows"
 [ -n "${_cli_mnbt}" ] && MAX_NUM_BATCHED_TOKENS="$_cli_mnbt"
+[ -n "${_cli_maxlen}" ] && MAX_MODEL_LEN="$_cli_maxlen"
+[ -n "${_cli_dft}" ] && DFLASH_TOKENS="$_cli_dft"
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
 [ -n "${_cli_util}" ] && GPU_MEM_UTIL="$_cli_util"
 [ -n "${_cli_lm}" ] && LANGUAGE_MODEL_ONLY="$_cli_lm"
@@ -154,6 +158,7 @@ SPEC_METHOD="${SPEC_METHOD:-dflash}"
 DFLASH_MODEL="${DFLASH_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
 DFLASH_CACHE_NAME="${DFLASH_CACHE_NAME:-models--${DFLASH_MODEL//\//--}}"
 DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
+DFLASH_SAMPLE="${DFLASH_SAMPLE:-probabilistic}"
 # 2 = shard the ~2.3 GiB DFlash2 drafter across TP (C4 keep, 2026-08-30:
 # idle 8k 938 / 16k 972 / 100k 997; decode structured 65.1 / prose 27.1).
 # 1 = rank 0 only (no CX7 on every draft step). Empty = inherit target TP.
@@ -866,7 +871,7 @@ ARGS=(
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
-spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
+spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":os.environ.get("DFLASH_SAMPLE","probabilistic"),"rejection_sample_method":"standard"}
 tp=os.environ.get("DFLASH_DRAFT_TP","").strip()
 if tp:
     spec["draft_tensor_parallel_size"]=int(tp)
@@ -958,7 +963,7 @@ ARGS=(
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
-spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
+spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":os.environ.get("DFLASH_SAMPLE","probabilistic"),"rejection_sample_method":"standard"}
 tp=os.environ.get("DFLASH_DRAFT_TP","").strip()
 if tp:
     spec["draft_tensor_parallel_size"]=int(tp)
@@ -1106,7 +1111,7 @@ launch_cluster() {
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
-             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_SAMPLE DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED MODEL_DIR EXTRA_ARGS \
@@ -1189,6 +1194,7 @@ launch_cluster() {
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
+        -e DFLASH_SAMPLE="${DFLASH_SAMPLE:-probabilistic}" \
         -e DFLASH_MODEL_DIR="${DFLASH_MODEL_DIR:-}" \
         -e DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP:-}" \
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
