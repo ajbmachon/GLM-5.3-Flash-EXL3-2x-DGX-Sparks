@@ -26,6 +26,55 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
 
+## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
+
+`EXL3_FAT_GROUPED=1` (launcher default since 2026-09-07) replaces the E2 per-expert host loop for "fat" experts with three
+GPU-driven launches per MoE layer (gather, gate/up + SwiGLU, down + scatter) built from
+device-side segment tables — no per-expert launches, no weight repacking, no host sync
+(`overlay/exl3_fat_moe.cu`, Fable's design, E2 rounding boundaries restored).
+
+**Latest run — 2026-09-07, measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).**
+Shipped E3 image `glm53-flash-sm121:e3-20260907` at `MAX_MODEL_LEN=900000`, `GPU_MEM_UTIL=0.86`,
+`GLM53_INDEXER_WORKSPACE=rightsize`, `EXL3_TEMP_ROWS_FUSED=32`, MNBT 7168, `MAX_NUM_SEQS=4`,
+DFlash2 k=7 draft TP=2, C4, thinking off.
+
+| Prompt | Prompt tok | TTFT | Prefill tok/s |
+|---|---:|---:|---:|
+| ~8k | 8,221 | 5.51 s | **1,492.1** |
+| ~16k | 16,411 | 10.56 s | **1,553.7** |
+| ~32k | 32,797 | 22.96 s | **1,428.2** |
+| ~64k | 65,566 | 41.31 s | **1,587.0** |
+| ~128k | 131,101 | 83.95 s | **1,561.7** |
+| ~256k | 262,173 | 172.84 s | **1,516.8** |
+
+**A/B receipt vs E2 (2026-09-06 overnight run).** Measured
+on this kit: **MAX_MODEL_LEN=500000**, `GPU_MEM_UTIL=0.84`, `GLM53_INDEXER_WORKSPACE=rightsize`,
+`EXL3_TEMP_ROWS_FUSED=32`, MNBT 7168, DFlash2 k=7 draft TP=2, C4, thinking off, unique cold
+prompts (0 prefix hits). Prefill tok/s = prompt tokens / TTFT (client side).
+
+| Prompt | Prompt tok | TTFT | Prefill tok/s | E2 before (tok/s) | Gain |
+|---|---:|---:|---:|---:|---:|
+| ~8k (first request after boot) | 8,221 | 8.23 s | 999 | 1,112 warm / 418 first | one-time allocation; warm ~1,500 |
+| ~16k | 16,417 | 10.41 s | **1,578** | 1,155 | **+37%** |
+| ~32k | 32,798 | 20.20 s | **1,624** | ~1,160 | **+40%** |
+| ~64k | 65,565 | 40.06 s | **1,637** | ~1,170 | **+40%** |
+| ~128k | 131,101 | 80.46 s | **1,629** | 1,148–1,183 (100k) | **+38–42%** |
+| ~256k | 262,173 | 166.4 s | **1,576** | 1,087 | **+45%** |
+
+E2 column: the 2026-09-01 E2 receipts (`logs/pr77-build-kernel-20260901`) and the matched
+E2 baselines of the 2026-09-06 overnight run (`logs/overnight-20260906T164059Z/exp500k`,
+A/B/A at 500k: 8k 1,112 / 16k 1,154 / 100k 1,183, repeats within 0.5%); 32k/64k interpolated.
+Decode is unchanged (E3 never runs on decode-sized steps; structured / prose / code within
+run-to-run spread). Isolated layer bench: 7168-token MoE layer 77–91 ms (E2) → 31 ms (E3),
+numerically indistinguishable from E2 vs the LinearEXL3 reference. Full receipts, gates and
+the memory caveat: `logs/overnight-20260906T164059Z/report.md`.
+
+**Context and headroom:** the shipped default is now **850k / util 0.85 / rightsize** (boots with ~0.5 GiB of KV margin on the head; a 256k prefill ran at 900k / 0.87 with driver retries but no failure). E3 keeps a 560 MiB fat-row scratch that vLLM's profile run charges to
+the KV budget, so at 1M / util 0.87 the pool no longer fits one 1M request on this kit
+(needs 14.52 GiB). 500k needs 10.98 GiB and boots reliably at 0.84 (1.2× at 500k). Prompts
+≥ ~100k are near the head's host-memory limit at any setting (a 256k prefill at util 0.87
+with zero MemAvailable crashed the head on 2026-09-06); the 256k row above ran at 0.84.
+
 ## Decode (this kit, 2026-08-28)
 
 Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1→200) and **Code** (`clamp_00`…`clamp_49`) — same high-accept regime. Temp **0**, thinking **off**, 400 tokens, CUDA graphs, fused EXL3 MoE. Prompt types, not grammar / schema. Stream tok/s is per request; aggregate is all streams.
@@ -36,7 +85,7 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 | **×2** | 6.62 s | 51.7 | 103.3 |
 | **×4** | 6.30 s | 37.1 | 146.5 |
 
-Serve recipe is `--max-model-len 1000000` with KV pool **1,754,237** tokens (1.75× a full 1M request) at util 0.87. These runs are warm / empty KV — they do not need a filled 1M cache.
+That 2026-08-28 decode serve used `--max-model-len 1000000` with a **1,754,237-token** KV pool. These runs are warm / empty KV — they do not need a filled 1M cache.
 
 Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, 2026-08-30 C4, `DFLASH_DRAFT_TP=2`): Structured **65.1** tok/s (0.959 accept / 6.71 per step); Prose (hash-map) **27.1** (0.341 / 2.39). Prior TP=1 lab: 61.7 / 26.9. Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
@@ -53,6 +102,30 @@ python3 tests/bench_decode.py --phase structured --structured --runs 5 --max-tok
 # prose (hash-map explanation)
 python3 tests/bench_decode.py --phase prose --runs 5 --max-tokens 400 --skip-coherence --out /tmp/glm53-prose.json
 ```
+
+## E2 fat-expert prefill — [PR77](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/77) (2026-09-01)
+
+PR77 adds purpose-built direct/scatter CUDA kernels for the routed “fat”
+experts and lifts fully uncached long-context prefill by about **20–21%**.
+The controlled promotion ran E2 on → legacy off → E2 on at MNBT 2048, with
+five unique-salt cold samples per rung per boot:
+
+| Fully uncached rung | Legacy mean tok/s | PR77 pooled mean tok/s | Gain |
+|---|---:|---:|---:|
+| ~8K | 941.04 | 1132.32 | **+20.33%** |
+| ~100K | 1023.20 | 1241.71 | **+21.36%** |
+| ~300K | 995.05 | 1201.02 | **+20.70%** |
+
+All 45 observations passed the cold gate, with complete separation at every
+rung. A second 2× DGX Spark deployment reproduced **+21.0% at 100K** and
+**+20.4% at 300K**. These repeated results establish E2 as the production
+prefill path; the decode path is unchanged. They replace earlier preliminary
+figures that included APC hits.
+
+On the independent `MAX_NUM_SEQS=16` geometry, MNBT 2048 delivered the best
+measured balance of prefill throughput and KV capacity. MNBT 7168 remains the
+current maintainer default for `MAX_NUM_SEQS=4`, pending a repeated same-kit
+comparison.
 
 ## Quality (KLD)
 
@@ -87,13 +160,13 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
-| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Live pool **1,754,237** tokens / **1.75×** at 1M / 690 GPU blocks / 18.67 GiB. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Latest validated 7168/rightsize pool: **1,243,902** tokens / **1.24×** at 1M. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
+| Context | **850k** default since 2026-09-07 (E3; `EXL3_FAT_GROUPED=0` fits 1M again). KV pool is **~1M tokens** (measured 989,010 at 900k / util 0.85, and 1,023,626-1,084,615 at 900k / util 0.86; pool size varies ±0.4 GiB between identical boots, and the 850k default is not yet measured). Pre-E3 1M receipts: live pool **1,754,237** tokens (1.75×) / 690 GPU blocks / 18.67 GiB at MNBT 2048; latest validated 7168/rightsize E2 pool at 1M **1,243,902** tokens / **1.24×**. Pool size varies with MNBT, activation/graph reservations and hybrid block geometry. Padded slot-share is why 1M allocates; the old 900k cap was 1.95× on this same pool. Do not drop to 256k to “free” slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
-| Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=1, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Context | **1M** (`MAX_MODEL_LEN=1000000`). Live pool **1,754,237** tokens (1.75×) / 690 GPU blocks / 18.67 GiB. Padded slot-share is why 1M allocates; the old 900k cap was 1.95× on this same pool. Do not drop to 256k to “free” slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
+| Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=2, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
 | Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
@@ -221,8 +294,8 @@ also disables GB10 `persistent_topk` so long-history decode uses
 
 `--kv-cache-dtype fp8` is required. The SM12x sparse-MLA kernel only accepts packed
 `fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch. Metrics report
-`cache_dtype=fp8`; that is the **target** path. The logged **1,754,237** tokens
-are hybrid BlockPool accounting, not 1.75M tokens of uniform fp8 tensors.
+`cache_dtype=fp8`; that is the **target** path. The 2026-08-29
+**1,754,237-token** receipt is hybrid BlockPool accounting, not uniform fp8 tensors.
 
 | Piece | Dtype / layout | Notes |
 |---|---|---|
@@ -232,8 +305,8 @@ are hybrid BlockPool accounting, not 1.75M tokens of uniform fp8 tensors.
 | DFlash2 draft (5 SWA layers) | **`auto`/bf16**, 2048 B/token this boot | no MLA FP8 backend on SM121 |
 
 With DFlash2 + vision + util **0.87**, the pool is leftover UMA after weights and
-CUDA graphs. Live boot (confirm `padded slot-share` and `Maximum concurrency`
-in the log):
+CUDA graphs. The 2026-08-29 boot below records the padded-slot-share allocator
+state:
 
 | | |
 |---|---|
@@ -243,6 +316,9 @@ in the log):
 | Available KV memory | **18.67 GiB** |
 | `kv_cache_max_concurrency` | 1.949… |
 | Boot line | `padded slot-share block=64 mla_page=2351104 (was block=16); draft_bytes/token=2048` |
+
+Latest validated boot (2026-09-01, MNBT 7168, `MAX_NUM_SEQS=4`, E2 and
+indexer rightsizing on): **1,243,902 KV tokens / 1.24× at 1M**.
 
 DFlash2 cannot exact-fit the 656 B MLA page, so the five SWA layers **padded
 slot-share** the MLA tensors: manager `block_size=64` (indexer kernel size; not
@@ -268,7 +344,7 @@ Live occupancy, temp **0**, thinking **off**, unique pads, `max_tokens=8`:
 | ~300k ×1 streamed | **200** | **26.0%** | **356 s** TTFT (~840 tok/s) | 299,213 prompt tokens, gen `OK`; MNBT=1024 remeasure **323 s** / ~928 tok/s; production MNBT=2048 **319 s** / **941** tok/s |
 
 Live **3×256k** held (the original failure). Prefills still serialize under skip; two 256k contexts were in KV at once at 29.5%. One 256k sat ~25%. Hybrid occupancy is a large length-independent floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 256k → ~25%, 300k → 26%.
-Default is **1M**. Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots —
+Default is **850k** (E3; was 1M). Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots —
 logged tokens ≈ concurrency × that cap, and the hybrid floor then shrinks the
 pool.
 
@@ -296,7 +372,7 @@ does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
 (skipping a mamba miss is a correctness hole). Do not raise
 `--max-num-batched-tokens` to “fix” APC.
 
-**Live receipts** (thinking off, temp 0, unique pads), 1M serve, **`MAX_NUM_BATCHED_TOKENS=2048`** (P1 keep; 3584/4096 reverted), **`DFLASH_DRAFT_TP=2`**. Idle 8k/16k/100k are the 2026-08-30 C4 keep A/B. 12k/256k/300k and the concurrent follow-ups are the prior TP=1 production ladder (chunk size does not change those hit counts). The MNBT=1024 baseline is `docs/cold-prefill.md`. Details: `docs/improve-prefill.md`.
+**Historical pre-E2 receipts** (thinking off, temp 0, unique pads), 1M serve, **`MAX_NUM_BATCHED_TOKENS=2048`** (P1 keep; 3584/4096 reverted), **`DFLASH_DRAFT_TP=2`**. Idle 8k/16k/100k are the 2026-08-30 C4 keep A/B. 12k/256k/300k and the concurrent follow-ups are the prior TP=1 production ladder (chunk size does not change those hit counts). The MNBT=1024 baseline is `docs/cold-prefill.md`. Details: `docs/improve-prefill.md`.
 
 | Turn | Hits | Compute | Prompt tok | TTFT | Prefill tok/s |
 |---|---:|---:|---:|---:|---:|
@@ -312,15 +388,16 @@ does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
 | 4× ~7.5k concurrent follow-ups | **7168 each** (28672 total) | rest | 7515 each | **1.86–2.50 s** | — |
 
 An ~8k follow-up still reuses **7168 / 8004 ≈ 90%** of the prompt, not 46%. MNBT=2048 vs the 1024 ladder (draft TP=1): ~8k 10.36 s / 772 → 8.93 s / 895; ~100k 105.6 s / 947 → 102.5 s / 975; ~256k 273 s / 936 → **263 s / 973**; ~300k 323 s / 928 → **319 s / 941**. C4 keep (`DFLASH_DRAFT_TP=2`): ~8k **8.53 s / 938**; ~16k **16.45 s / 972**; ~100k **100.3 s / 997**. Coarser decode interleave (2k-token chunks vs 1k).
+
 Hits work **below** UserHIJ’s 14,336-token floor (that floor is 896-chunk ×
 2048-align LCM on a different geometry; this kit’s 3584 is 4×896). Isolation
 held (`STILL_READY_S` / `STILL_C0`…`C3`). Idle chats are not reserved; after
 the pool drains, a later turn of an old window prefills again. Concurrent
 colds still serialize under `GLM53_MIXED_PREFILL_CHUNK=skip` (`Deferred`).
 
-This 1M boot: **1,670,157** tokens / **1.67×** / 638 GPU blocks (padded
-slot-share still applied). The 900k process measured 1,754,237 / 690 blocks
-on the same recipe; the delta is leftover UMA, not a slot-share collapse.
+A later pre-E2 1M boot measured **1,670,157** tokens / **1.67×** / 638 GPU
+blocks (padded slot-share still applied). The 900k process measured 1,754,237 /
+690 blocks on the same recipe; the delta is leftover UMA, not a slot-share collapse.
 
 Re-measure (see also `tests/bench_prefix_cache.py`):
 
@@ -368,7 +445,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on the head, then the same pull on the worker if GHCR is reachable. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_SHIP=1` never copies.
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
 5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
@@ -380,11 +457,26 @@ The worker does not need GHCR access — start.sh pulls there when it can, other
 ./download.sh                              # head HF cache only (no worker); same as ./start.sh download
 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh     # weights already local on both nodes
 SKIP_PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # keep local image, no GHCR
-BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # rebuild overlay from this repo + ship
+# overlay/Dockerfile change after git pull rebuilds once; SKIP_BUILD=1 skips that
+BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # force rebuild overlay + ship
 ./start.sh status
 ./start.sh logs                # head
 ./start.sh logs worker
 ./start.sh stop                # or ./stop.sh
+```
+
+### Experimental: 4× Spark (TP=4)
+
+Untested here (no 4-Spark kit). Optional sibling of `./start.sh` — same image
+and weights, does not change the supported 2× path. First run copies
+`.env.tp4.example` → `.env.tp4` (gitignored). Stop with `./start-tp4.sh stop`;
+`./start.sh stop` does not know ranks 2/3.
+
+```bash
+# edit WORKER2_IP / WORKER3_IP / CX7 pins in .env.tp4
+./start-tp4.sh
+./start-tp4.sh stop
+./start-tp4.sh logs            # head; logs 1|2|3 for a worker rank
 ```
 
 Do not pull `glm53-flash-sm121:v8` — that is the older NVFP4/Ray kernel.
@@ -417,6 +509,35 @@ an OpenAI Python SDK option that merges its contents into the top-level request.
 The Hub `generation_config.json` stamps `temperature=1.0` / `top_p=0.95` unless
 the request overrides. The launcher sets
 `--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
+
+### Client request defaults
+
+The launcher tunes the server; these are the request-side knobs the chat
+template reads. None of them need a restart, and none are enforced by
+`.env` — a route that drifts here is invisible from the server side.
+
+| Field | Send | Why |
+|---|---|---|
+| `reasoning_effort` | `high` for reasoning work | Unset = **Max** (`files/chat_template.jinja:7`); `low` is the model card's lightest simple-Q&A mode. Keep it constant per route — see below |
+| `max_tokens` | ≥ `32768` with thinking on | Max-effort reasoning runs well past 8k output tokens. Too small a cap truncates mid-thought and the reply comes back with empty `content` |
+| `chat_template_kwargs.clear_thinking` | `true` for multi-turn agents | Replaces earlier turns' reasoning with `<think></think>` (`chat_template.jinja:154`), keeping the current tool-call chain. Cuts context, not answer quality |
+| `top_p` / `temperature` | leave unset | `generation_config.json` already supplies `0.95` / `1.0`; the boot log prints the override line. Sending `top_p=1.0` explicitly overrides that and is worse |
+
+Read the reply from **`reasoning`**, not `reasoning_content`. The response
+models carry `reasoning` only (`ChatMessage`, `DeltaMessage`); vLLM accepts the
+deprecated name on *input* and renames it, but never emits it. A client reading
+`reasoning_content` gets nothing and the thinking looks like it leaked into
+`content` — it did not:
+
+```console
+$ curl -s $BASE/v1/chat/completions -d '{...,"reasoning_effort":"low"}' | jq '.choices[0].message | keys'
+["annotations","audio","content","function_call","reasoning","refusal","role"]
+```
+
+**Do not vary `reasoning_effort` per request within a conversation.** The effort
+word lands at char 39 of the prompt, so changing it is a full prefix-cache miss
+on an otherwise-warm conversation, not a partial one.
+`tests/test_chat_template.py` pins that shape.
 
 Needs: Docker (no sudo) on both nodes, passwordless SSH head → worker,
 `hf` / `huggingface-cli` + `curl` + `rsync` on the head, ~180 GiB free per
@@ -461,7 +582,7 @@ that are now documented/enforced:
 | `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo into the HF cache (mirror) |
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
-| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag; pulled on every start. `SKIP_PULL=1` skips. `BUILD=1` rebuilds the overlay |
+| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
@@ -482,13 +603,18 @@ that are now documented/enforced:
 | DFlash2 attention | *(unset)* | SM121 picks FLASH_ATTN for non-causal SWA. Do not pin `TRITON_ATTN` |
 | `ENFORCE_EAGER` | `0` | CUDA graphs; MTP capture `1 2 3 4 6 8 12`, DFlash2 `1 2 4 8 16 24 32` |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
-| `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool **1,754,237** tokens / **1.75×** at 1M / 690 blocks / 18.67 GiB) |
-| `MAX_MODEL_LEN` | `1000000` | default context. 1M allocates on the 1.75M padded-slot-share pool. Do not drop to 256k to “free” KV — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool |
+| `EXL3_FAT_KERNEL` | `1` | [PR77 E2 fat-expert prefill kernel](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/77) (implies batched+sorted). `0` = legacy fat path |
+| `EXL3_FAT_GROUPED` | `1` | E3 grouped fat-expert tier (`overlay/exl3_fat_moe.cu`): one gather + gate/up + down launch per layer from device-side tables, no host sync. **+37–45% cold prefill** measured (see *Cold prefill (E3)*). Default on since 2026-09-07 with the launcher defaults 850k / util 0.85 / rightsize / cap 32. Needs an image with the E3 kernels (fails closed at load otherwise). `0` = E2 kernel path (then set `MAX_MODEL_LEN=1000000`, cap 256 is picked automatically). 1M does not fit with E3 at util ≤ 0.87 on this kit (560 MiB scratch charged to the KV budget) |
+| `EXL3_TEMP_ROWS_FUSED` | `32` with E3, `256` with E2 (launcher picks by `EXL3_FAT_GROUPED` unless set) | fused `exl3_moe` rows per expert; experts above it are "fat". Keep ≥ `MAX_NUM_SEQS × (DFLASH_TOKENS+1)` so decode stays one graph-safe launch. E2 wants 256 (its per-expert loop is host-bound) |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
-| `MAX_NUM_BATCHED_TOKENS` | `2048` | prefill chunk (P1 keep). 3584/4096 lost; 8192 oversubscribes GB10 indexer topk |
-| `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (2048) |
+| `MAX_NUM_BATCHED_TOKENS` | `7168` | current maintainer default at `MAX_NUM_SEQS=4`. MNBT 2048 was the clean PR77 A/B configuration and the best measured balance on an independent `MAX_NUM_SEQS=16` geometry. Tune per deployment; change after a repeated same-kit comparison |
+| `MAX_MODEL_LEN` | `850000` | default context since 2026-09-07 (E3 default; 1M fits again with `EXL3_FAT_GROUPED=0`). 1M allocates on the 1.75M padded-slot-share pool. Do not drop to 256k to “free” KV — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool. At MNBT 7168 one 1M request needs **14.52 GiB** KV (10.98 GiB at 500k; ~7.4 GiB fixed + 7.1 GiB per 1M); the E3 recipe runs 500k |
+| `GPU_MEM_UTIL` | `0.85` | GB10 UMA budget (default lowered from 0.87 on 2026-09-07: each 0.01 is 1.2 GiB of host headroom, and long prefills need it — see *Cold prefill (E3)*). E3 at 900k / 0.85: pool ~1.05M tokens / 1.17× (0.87: 16.2 GiB / 1,051,648 tokens). Pre-E3 receipts at 1M / 0.87: 1,754,237 tokens / 18.67 GiB (MNBT 2048); 1,243,902 tokens / 1.24× (7168, rightsize, E2) |
+| `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
+| `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (7168) |
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
+| `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
+| `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
@@ -498,6 +624,8 @@ that are now documented/enforced:
 | `HEAD_CX7_IB` / `WORKER_CX7_IB` | `rocep1s0f1` / `rocep1s0f0` | NCCL HCAs |
 | `USE_HOST_NCCL` | `0` | image nvidia-nccl; host preload duplicates DeepEP |
 
+**Default from this checkout:** E2 fat kernel on (`EXL3_FAT_KERNEL=1`) and `MAX_NUM_BATCHED_TOKENS=7168`; the E3 grouped tier is the launcher default (`EXL3_FAT_GROUPED=1`, see *Cold prefill (E3)*). The pre-E2 C4 keep was 2048; the current E2 cold-prefill baseline is the linked PR77 table; E2 at 7168 is ~1,150–1,185 tok/s cold, E3 ~1,580–1,640.
+
 ## Image / overlay
 
 ```bash
@@ -505,21 +633,23 @@ docker build -t glm53-flash-sm121:local .
 # or: BUILD=1 ./start.sh
 ```
 
-`./start.sh` **pulls** `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3`
-(public) on every start unless `SKIP_PULL=1`. `BUILD=1` rebuilds the overlay from
-this Dockerfile instead. After CUDA compile, Python overlay edits
-(`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild
-`exllamav3_ext`.
+`./start.sh` **rebuilds** from this Dockerfile when the image label `glm53.recipe.stamp` does not match the current overlay/Dockerfile hash — that is what makes a `git pull` pick up `exl3_fat_gemm` instead of staying on the public GHCR tag (which predates E2). `SKIP_BUILD=1` keeps GHCR. `BUILD=1` forces a rebuild. `SKIP_PULL=1` skips `docker pull` only.
+
+After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild `exllamav3_ext`.
 
 | Path | Role |
 |---|---|
 | `Dockerfile` | NoPE sparse-MLA patches + EXL3 install (`sm_121a`) + self-check |
-| `overlay/exl3.py` | `Exl3Config` / packed load / TP shard / fused `exl3_moe` apply |
+| `overlay/exl3.py` | `Exl3Config` / packed load / TP shard / fused `exl3_moe` apply / E2 fat kernel |
+| `overlay/exl3_fat_gemm.cu` | additive `exl3_fat_gemm` / `_scatter` compiled into `exllamav3_ext` |
+| `overlay/exl3_fat_moe.cu` / `.cuh` | E3 grouped fat-expert kernels (gather / gate-up+SwiGLU / down+scatter); compiled into `exllamav3_ext` by the full build, or as the additive `exl3_fat_moe_ext` module by `Dockerfile.e3-layer` + `overlay/build_exl3_fat_moe_ext.py` |
+| `tests/bench_e3_microbench.py` | CUDA-event MoE-layer timing E2 vs E3 + production-geometry parity (isolated, serving stopped) |
 | `overlay/patch_exl3_ext_aarch64.py` | stub AVX CPU allreduce so the ext builds on GB10 |
 | `overlay/patch_model_overrides.py` | `"exl3"` in ModelConfig overrides |
-| `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0` |
+| `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0`, E2 diag schema, E3 grouped tables/parity/graph-replay/fallback checks |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
 | `start.sh` / `stop.sh` / `download.sh` | 2-node launch; Hub fetch on the head only |
+| `start-tp4.sh` / `.env.tp4.example` | experimental 4-node TP=4 launch; knobs stay out of `.env` |
 | `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
 | `overlay/qwen3_dflash2.py` | DFlash2 draft (grouped conv + candidate selector) |
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
@@ -533,6 +663,10 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `tests/test_xgrammar_termination.py` | exact two-file patch, idempotence, cross-file fail-closed drift, termination/rollback/reset and post-reasoning draft behavior, launcher wiring |
 | `overlay/patch_kpool_tail_slotmap.py` | clamp KpoolTail one-block circular slot mapping; identity for other KV groups |
 | `tests/test_kpool_tail_slotmap.py` | circular addressing math, exact kernel patch, idempotence, fail-closed drift, launcher wiring |
+| `overlay/patch_indexer_workspace.py` | opt-in `GLM53_INDEXER_WORKSPACE=rightsize`: size the sparse-indexer prefill workspace to the legal per-step maximum instead of `max_model_len * 40`; boot-time compress-ratio cross-check |
+| `tests/test_indexer_workspace.py` | sizing formula (MNBT/`max_num_seqs`/spec-token edge cases, stock clamp), chunk-list equivalence vs stock by exhaustion, exact three-site patch, idempotence, fail-closed drift, launcher wiring |
+| `overlay/patch_spinwait.py` | opt-in numeric `GLM53_SPINWAIT_MS`: fail-closed runtime patch of SpinCondition's reader busy-loop window on both ranks |
+| `tests/test_spinwait_patch.py` | numeric contract, exact patch, idempotence, drift rejection, mode preservation, pyc cleanup, and launcher/build wiring |
 | `overlay/ablit_runtime.py` | load-time o_proj transplant / projection (`ABLIT=1`); no-op when off |
 | `overlay/patch_ablit.py` | install the load_weights hook; bind-mounted and run on both ranks |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published recipe; `fetch_transplant.py` + `transplant/` for the donor o_proj byte-copy |
@@ -554,7 +688,11 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 
 ## License
 
-This repository (serve scripts, overlay, docs) is **MIT**. The EXL3/TR3
+This repository (serve scripts, overlay, docs) is **[AGPL-3.0](LICENSE)**.
+If you run a modified version as a network service, the AGPL requires you to
+offer its source to users of that service. Contributions made before
+2026-09-07 were licensed MIT; that notice is retained in
+[`LICENSE.MIT`](LICENSE.MIT). The EXL3/TR3
 checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw/blob/main/LICENSE)
 (unmodified upstream LICENSE; also on
 [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)).
