@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the real preflight with fake sysfs and local-only worker commands."""
 
+import re
 from pathlib import Path
 import subprocess
 
@@ -36,6 +37,7 @@ cat() {
     case "$1" in
         /sys/class/infiniband/*)
             command cat "$FAKE_SYSFS/$FAKE_NODE/${1#/sys/class/infiniband/}" ;;
+        /proc/meminfo) command cat /proc/meminfo ;;
         *) printf 'unexpected cat: %s\n' "$*" >&2; return 1 ;;
     esac
 }
@@ -52,6 +54,12 @@ def run_preflight(tmp_path, head_count=2, worker_count=2, broken=None):
     source = (ROOT / "start.sh").read_text()
     begin = source.index("preflight() {")
     end = source.index("\n}\n", begin) + 3
+    # preflight calls the memory guard; load it too so the body runs unchanged.
+    mem_begin = source.index("# GLM53 preflight memory guard (begin)")
+    mem_end = source.index("# GLM53 preflight memory guard (end)")
+    source = source[:begin] + source[mem_begin:mem_end] + source[begin:]
+    end += mem_end - mem_begin
+    begin = source.index("read_meminfo_kib() {")
     for node in HCAS:
         for hca in HCAS[node]:
             port = tmp_path / "sysfs" / node / hca / "ports/1"
@@ -89,14 +97,16 @@ def run_preflight(tmp_path, head_count=2, worker_count=2, broken=None):
         "WORKER_CX7_IB": ",".join(HCAS["worker"][:worker_count]),
         "HEAD_GID": GIDS["head"], "WORKER_GID": GIDS["worker"],
         "TP": "2", "NNODES": "2", "CONTAINER_WORKER": "fake-worker",
+        # Memory guard: 1% of the host with no headroom passes on any test host.
+        "GPU_MEM_UTIL": "0.01", "GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB": "0",
         "PORT": "8888", "MASTER_PORT": "29521", "SCRIPT_DIR": str(tmp_path),
         "ABLIT": "0", "HF_CACHE_DIR": str(tmp_path / "head-cache"),
         "WORKER_HOME": str(tmp_path), "WORKER_CACHE_DIR": str(tmp_path / "worker-cache"),
     }
-    for key in ("STOP_PATCH_HOST", "SCHED_PATCH_HOST", "DRAFTER_PATCH_HOST",
-                "APC_PATCH_HOST", "PERGROUP_PATCH_HOST", "XGRAMMAR_PATCH_HOST",
-                "KPOOL_TAIL_PATCH_HOST", "SPINWAIT_PATCH_HOST", "ADAPTIVE_K_PATCH_HOST",
-                "DENSE_FP8_PATCH_HOST", "EXL3_OVERLAY_HOST"):
+    # Every overlay path preflight checks gets a placeholder; derive the list
+    # from the exercised body so a new overlay cannot silently break this harness.
+    overlay_keys = set(re.findall(r"\b([A-Z0-9_]+_PATCH_HOST)\b", source[begin:end])) | {"EXL3_OVERLAY_HOST"}
+    for key in sorted(overlay_keys):
         env[key] = str(placeholder)
     return subprocess.run(
         ["bash", "-c", STUBS + source[begin:end] + "\npreflight\n"],

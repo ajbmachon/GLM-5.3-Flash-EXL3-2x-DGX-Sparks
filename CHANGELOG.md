@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — per-rank GID index `auto`
+
+`HEAD_GID=auto` / `WORKER_GID=auto` make preflight resolve each rank's GID
+index from its live table: the index whose entry is the IPv4-mapped RoCE v2
+GID, required to be identical on every HCA the rank lists. GID tables
+renumber after a link flap or a peer reboot (2026-09-15: a head reboot moved
+the worker's entry from index 4 to 3 and the pinned `.env` refused to launch).
+A rank whose HCAs disagree, or that has the IPv4 entry only as RoCE v1, stays
+unresolved and the existing table dump shows the candidates. Numeric values
+behave as before. Test: `tests/test_gid_auto.py`. The GID preflight harness
+now also loads the memory-guard block that preflight has called since the
+unified-memory check landed, so `tests/test_nccl_multi_hca.py` runs again.
+
 ## Unreleased — omitted-only output-token defaults
 
 `DEFAULT_MAX_NEW_TOKENS` now changes only omitted request limits, including

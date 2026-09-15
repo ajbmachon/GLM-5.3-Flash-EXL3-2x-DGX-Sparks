@@ -979,6 +979,56 @@ preflight() {
     local -a head_hcas worker_hcas
     IFS=, read -r -a head_hcas <<< "$HEAD_CX7_IB"
     IFS=, read -r -a worker_hcas <<< "$WORKER_CX7_IB"
+
+    # [glm53-gid-auto] HEAD_GID / WORKER_GID = auto: use the index whose entry is
+    # the IPv4-mapped RoCE v2 GID, and require the same index on every listed
+    # HCA of that rank (NCCL applies one index per rank). GID tables renumber
+    # after a link flap or reboot (2026-09-15: the worker's entry moved from
+    # index 4 to 3 while .env still pinned 4), so a pinned index breaks the
+    # next launch. On failure the value stays unresolved so the table dump
+    # below shows the operator every candidate.
+    local auto_node auto_pick auto_found auto_rows auto_idx auto_gid auto_type
+    local -a auto_hcas
+    for auto_node in head worker; do
+        if [ "$auto_node" = head ]; then
+            [ "$HEAD_GID" = auto ] || continue
+            auto_hcas=("${head_hcas[@]}")
+        else
+            [ "$WORKER_GID" = auto ] || continue
+            auto_hcas=("${worker_hcas[@]}")
+        fi
+        auto_pick=""
+        for hca in "${auto_hcas[@]}"; do
+            if [ "$auto_node" = head ]; then
+                auto_rows="$(for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                    printf '%s %s %s\n' "$i" \
+                        "$(cat "/sys/class/infiniband/${hca}/ports/1/gids/$i" 2>/dev/null)" \
+                        "$(cat "/sys/class/infiniband/${hca}/ports/1/gid_attrs/types/$i" 2>/dev/null)"
+                done)"
+            else
+                auto_rows="$(worker_ssh "for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do printf '%s %s %s\n' \"\$i\" \"\$(cat /sys/class/infiniband/${hca}/ports/1/gids/\$i 2>/dev/null)\" \"\$(cat /sys/class/infiniband/${hca}/ports/1/gid_attrs/types/\$i 2>/dev/null)\"; done" || true)"
+            fi
+            auto_found=""
+            while read -r auto_idx auto_gid auto_type; do
+                case "$auto_gid" in 0000:0000:0000:0000:0000:ffff:*) ;; *) continue ;; esac
+                case "$auto_type" in *"RoCE v2"*) auto_found="$auto_idx"; break ;; esac
+            done <<< "$auto_rows"
+            if [ -z "$auto_found" ]; then
+                warn "${auto_node} ${hca}: no IPv4-mapped RoCE v2 GID entry, ${auto_node} GID=auto cannot resolve"
+                auto_pick="unresolved"
+                break
+            fi
+            if [ -z "$auto_pick" ]; then
+                auto_pick="$auto_found"
+            elif [ "$auto_pick" != "$auto_found" ]; then
+                warn "${auto_node} ${hca}: RoCE v2 IPv4 GID at index ${auto_found} but another ${auto_node} HCA has it at ${auto_pick}; NCCL applies one index per rank"
+                auto_pick="unresolved"
+                break
+            fi
+        done
+        [ "$auto_pick" = unresolved ] || log "${auto_node} GID index auto-resolved to ${auto_pick} (${auto_hcas[*]})"
+        if [ "$auto_node" = head ]; then HEAD_GID="$auto_pick"; else WORKER_GID="$auto_pick"; fi
+    done
     for hca in "${head_hcas[@]}"; do
         gid_path="/sys/class/infiniband/${hca}/ports/1/gids/${HEAD_GID}"
         if [ -z "$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)" ]; then
