@@ -81,6 +81,8 @@ _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
+_cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
+_cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -110,6 +112,7 @@ set +a
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
+[ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -224,7 +227,7 @@ LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
 # JSON default cannot sit in ${LIMIT_MM:-{...}} — } ends the expansion.
 if [ -z "${LIMIT_MM:-}" ]; then
-    LIMIT_MM='{"image":4,"video":1}'
+    LIMIT_MM='{"image":100,"video":1}'
 fi
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
@@ -276,8 +279,15 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
-# skip = do not mix; N>0 = cap tokens; 0 = off.
-GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# fair = time-share mixing (default since 2026-09-15, overlay v5);
+# skip = do not mix; N>0 = cap mixed prefill tokens; 0 / off = no isolation.
+# Fair knobs are forwarded on every rank even when CHUNK is not fair.
+GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
+GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
 # rightsize = the legal per-step maximum, ~+26% KV. Default applies only
@@ -388,6 +398,43 @@ _glm53_validate_spinwait_ms() {
         GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
 }
 
+_glm53_validate_mixed_prefill() {
+    if [ -n "${GLM53_MIXED_PREFILL_CHUNK+x}" ]; then
+        case "$GLM53_MIXED_PREFILL_CHUNK" in
+            skip|-1|0|off|no|fair) ;;
+            *)
+                _glm53_canonical_positive_int GLM53_MIXED_PREFILL_CHUNK \
+                    "$GLM53_MIXED_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+                ;;
+        esac
+        export GLM53_MIXED_PREFILL_CHUNK
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_CHUNK:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_CHUNK \
+            "$GLM53_FAIR_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_INTERVAL_MS \
+            "$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_STEP_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS \
+            "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_CHUNKS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_CHUNKS \
+            "$GLM53_FAIR_PREFILL_MAX_CHUNKS" 16 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_SHARE:-}" ]; then
+        if ! [[ "$GLM53_FAIR_PREFILL_SHARE" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+           || ! awk -v u="$GLM53_FAIR_PREFILL_SHARE" 'BEGIN { exit !(u >= 0 && u <= 1) }'; then
+            echo "GLM53_FAIR_PREFILL_SHARE must be between 0 and 1 (got: $GLM53_FAIR_PREFILL_SHARE)" >&2
+            return 2
+        fi
+        export GLM53_FAIR_PREFILL_SHARE
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -400,6 +447,15 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-stock}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    _glm53_validate_mixed_prefill || return
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
+        echo "GLM53_APC_RETENTION_INTERVAL is supported only by start.sh (TP=2); unset it for start-tp4.sh" >&2
+        return 2
+    fi
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
+        echo "GLM53_APC_RETENTION_INTERVAL_SWA is supported only by start.sh (TP=2); unset it for start-tp4.sh" >&2
+        return 2
+    fi
 }
 # GLM53 numeric config guard (end)
 
@@ -747,7 +803,10 @@ overlay_recipe_hash() {
             "$SCRIPT_DIR/ablit" \
             -type f \
             ! -path '*/__pycache__/*' \
+            ! -path '*/.pytest_cache/*' \
             ! -path '*/ablit/transplant/*' \
+            ! -path '*/files/nfs-server/*' \
+            ! -path '*/files/nfs-share.sh' \
             ! -name '*.pyc' \
             2>/dev/null
     } | LC_ALL=C sort | xargs -d '\n' -r sha256sum | sha256sum | awk '{print $1}'
@@ -804,12 +863,12 @@ ensure_image() {
     local head_ok=0 worker_ok=0 head_key="" worker_key=""
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         head_ok=1
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
     fi
     worker_ok=1
     for r in 1 2 3; do
         if worker_ssh_n "$r" "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
-            worker_key="$(worker_image_key "$r")"
+            worker_key="$(worker_image_key "$r" || true)"
             if images_match "$head_key" "$worker_key"; then
                 :
             else
@@ -837,13 +896,13 @@ ensure_image() {
     fi
     if [ "${BUILD:-0}" = "1" ]; then
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     elif image_from_registry && [ "$skip_pull" != "1" ]; then
         local before_key="$head_key"
         pull_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         if [ "$head_key" != "$before_key" ]; then
             log "pulled ${IMAGE} (${before_key:-missing} -> ${head_key})"
@@ -860,7 +919,7 @@ ensure_image() {
             die "SKIP_PULL=1 but ${IMAGE} is not on the head"
         fi
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     fi
@@ -869,13 +928,13 @@ ensure_image() {
     elif [ "$worker_ok" = "0" ]; then
         for r in 1 2 3; do
             local wok=0
-            worker_key="$(worker_image_key "$r")"
+            worker_key="$(worker_image_key "$r" || true)"
             if images_match "$head_key" "$worker_key"; then
                 continue
             fi
             if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ]; then
                 if pull_image_on_worker "$r"; then
-                    worker_key="$(worker_image_key "$r")"
+                    worker_key="$(worker_image_key "$r" || true)"
                     if images_match "$head_key" "$worker_key"; then
                         wok=1
                         log "rank ${r} pulled ${IMAGE} — matches head"
@@ -888,7 +947,7 @@ ensure_image() {
             fi
             if [ "$wok" = "0" ]; then
                 ship_image_to_worker "$r"
-                worker_key="$(worker_image_key "$r")"
+                worker_key="$(worker_image_key "$r" || true)"
                 if images_match "$head_key" "$worker_key"; then
                     :
                 elif worker_ssh_n "$r" "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
@@ -1373,6 +1432,11 @@ TP4_SKIP_OLD_SCP
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_CHUNK=$GLM53_FAIR_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_SHARE=$GLM53_FAIR_PREFILL_SHARE"
+        -e "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS=$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"

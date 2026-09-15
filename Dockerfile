@@ -451,9 +451,17 @@ COPY tests/test_suppress_stops.py /opt/glm53/test_suppress_stops.py
 COPY overlay/patch_scheduler_decode_floor.py /opt/glm53/patch_scheduler_decode_floor.py
 COPY tests/test_scheduler_decode_floor.py /opt/glm53/test_scheduler_decode_floor.py
 COPY overlay/patch_hybrid_prefix_hit.py /opt/glm53/patch_hybrid_prefix_hit.py
+COPY overlay/patch_apc_per_group_retention.py /opt/glm53/patch_apc_per_group_retention.py
+COPY tests/test_apc_per_group_retention.py /opt/glm53/test_apc_per_group_retention.py
 COPY tests/test_hybrid_prefix_hit.py /opt/glm53/test_hybrid_prefix_hit.py
+COPY overlay/patch_apc_no_store.py /opt/glm53/patch_apc_no_store.py
+COPY tests/test_apc_no_store.py /opt/glm53/test_apc_no_store.py
+COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py
+COPY tests/test_kv_capacity_log.py /opt/glm53/test_kv_capacity_log.py
 COPY overlay/patch_xgrammar_termination.py /opt/glm53/patch_xgrammar_termination.py
 COPY tests/test_xgrammar_termination.py /opt/glm53/test_xgrammar_termination.py
+COPY overlay/patch_cache_reset.py /opt/glm53/patch_cache_reset.py
+COPY tests/test_cache_reset_endpoint.py /opt/glm53/test_cache_reset_endpoint.py
 COPY overlay/patch_kpool_tail_slotmap.py /opt/glm53/patch_kpool_tail_slotmap.py
 COPY tests/test_kpool_tail_slotmap.py /opt/glm53/test_kpool_tail_slotmap.py
 COPY overlay/patch_spinwait.py /opt/glm53/patch_spinwait.py
@@ -470,13 +478,35 @@ RUN python3 /opt/glm53/patch_glm_eagle3.py
 RUN python3 /opt/glm53/patch_glm5_drafter_group.py
 RUN python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
 RUN python3 /opt/glm53/patch_scheduler_decode_floor.py
+RUN GLM53_KV_COORDINATOR_PY_SRC=/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py \
+    python3 /opt/glm53/test_apc_per_group_retention.py
 RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py
+RUN python3 /opt/glm53/patch_apc_per_group_retention.py
+# Runs BEFORE the no-store patch it validates, but AFTER the hybrid and
+# per-group retention overlays: Part A still stages the pre-no-store
+# sampling_params.py / v1/request.py / v1/core/block_pool.py and applies the
+# no-store patch to copies of them (the retention overlay leaves those anchors
+# and their patch mechanics untouched), while Part C composes the exact
+# hybrid + per-group + no-store stack on the real BlockPool / KVCacheManager /
+# coordinator. Both are mandatory in-image (GLM53_REQUIRE_VLLM=1,
+# GLM53_REQUIRE_COMPOSITION=1), including the fork's seven-group KpoolTailSpec
+# layout and the env-driven SWA-retention legs.
+RUN GLM53_VLLM_SRC_ROOT=/usr/local/lib/python3.12/dist-packages/vllm GLM53_REQUIRE_VLLM=1 GLM53_REQUIRE_COMPOSITION=1 python3 /opt/glm53/test_apc_no_store.py
+RUN python3 /opt/glm53/patch_apc_no_store.py
+# Same slot as the runtime GLM53_OVERLAY_ORDER (after per-group retention, after
+# the drafter-group patch it shares kv_cache_utils.py with): the host test
+# preflights the real file (both pinned anchors present, stock "GPU KV cache
+# size" line untouched) and replays the derivation before the log-only patch.
+RUN GLM53_KV_CACHE_UTILS_PY=/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py \
+    GLM53_REQUIRE_TARGET=1 python3 /opt/glm53/test_kv_capacity_log.py
+RUN python3 /opt/glm53/patch_kv_capacity_log.py
 RUN python3 /opt/glm53/patch_xgrammar_termination.py
 RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py
 # Applied unconditionally; the injected sizing reads GLM53_INDEXER_WORKSPACE
 # at runtime and returns the stock expression unless it is "rightsize".
 RUN python3 /opt/glm53/patch_indexer_workspace.py
 RUN python3 /opt/glm53/patch_spinwait.py --preflight
+RUN python3 /opt/glm53/patch_cache_reset.py
 RUN python3 /opt/glm53/patch_ablit.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
@@ -487,7 +517,8 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
-    && python3 /opt/glm53/test_ablit.py
+    && python3 /opt/glm53/test_ablit.py \
+    && python3 /opt/glm53/test_cache_reset_endpoint.py
 
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.
