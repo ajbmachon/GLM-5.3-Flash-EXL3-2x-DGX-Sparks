@@ -122,7 +122,7 @@ MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
 # Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
 MODEL_REVISION="${MODEL_REVISION:-25a44fdbf16862a46b7cc9921142c6c81350af2f}"
-IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
@@ -164,6 +164,9 @@ WORKER2_CX7_IB="${WORKER2_CX7_IB:-$WORKER_CX7_IB}"
 WORKER3_CX7_IF="${WORKER3_CX7_IF:-$WORKER_CX7_IF}"
 WORKER3_CX7_IB="${WORKER3_CX7_IB:-$WORKER_CX7_IB}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Empty = let NCCL pick the channel count. A positive integer pins both
+# NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS on all ranks (same knob as start.sh).
+NCCL_NCHANNELS="${NCCL_NCHANNELS:-}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
 # that node's own fabric IP. Most pairs share a good index; some do not (this kit
@@ -218,10 +221,22 @@ STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_
 SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode_floor.py}"
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
+PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Direct-I/O safetensors on the published InstantTensor image. Unset follows
+# IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
+# PREFIX_MATCH_UNIT empty = vLLM default hash grain.
+# 512 is illegal on this hybrid stack (KDA align block is 64).
+if [ -z "${LOAD_FORMAT+x}" ]; then
+    case "$IMAGE" in
+        *instanttensor*) LOAD_FORMAT=instanttensor ;;
+        *) LOAD_FORMAT= ;;
+    esac
+fi
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
@@ -284,9 +299,9 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Fair knobs are forwarded on every rank even when CHUNK is not fair.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
 GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
-GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.30}"
 GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
-GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-2000}"
 GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
@@ -435,6 +450,32 @@ _glm53_validate_mixed_prefill() {
     fi
 }
 
+# Prefix-cache retention intervals: "" (unset) and 0 pass; anything else is a
+# positive multiple of 3584, at most 1e6. Same rule as start.sh / the overlay.
+GLM53_APC_BLOCK_TOKENS=3584
+GLM53_APC_RETENTION_MAX=1000000
+_glm53_validate_retention_interval() {
+    local name="$1" value="$2" canonical
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    canonical="$value"
+    while [ "${canonical#0}" != "$canonical" ]; do canonical="${canonical#0}"; done
+    [ -n "$canonical" ] || canonical=0
+    if [ "$canonical" != 0 ] \
+       && { [ "${#canonical}" -gt "${#GLM53_APC_RETENTION_MAX}" ] \
+            || [ "$canonical" -gt "$GLM53_APC_RETENTION_MAX" ] \
+            || [ $((canonical % GLM53_APC_BLOCK_TOKENS)) -ne 0 ]; }; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    printf -v "$name" '%s' "$canonical"
+    # shellcheck disable=SC2163
+    export "$name"
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -448,12 +489,10 @@ validate_numeric_config() {
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
     _glm53_validate_mixed_prefill || return
-    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
-        echo "GLM53_APC_RETENTION_INTERVAL is supported only by start.sh (TP=2); unset it for start-tp4.sh" >&2
-        return 2
-    fi
-    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
-        echo "GLM53_APC_RETENTION_INTERVAL_SWA is supported only by start.sh (TP=2); unset it for start-tp4.sh" >&2
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
+        echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
 }
@@ -698,6 +737,7 @@ preflight() {
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
+    [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
@@ -835,7 +875,7 @@ pull_image() {
     log "pulling ${IMAGE} ..."
     docker pull "$IMAGE" && return 0
     die "docker pull ${IMAGE} failed.
-  :exl3 is a public GHCR package — check network / disk.
+  :exl3-instanttensor is a public GHCR package — check network / disk.
   If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
   Overlay rebuild: BUILD=1 ./start.sh. Recipe-stamp drift also rebuilds; SKIP_BUILD=1 keeps GHCR."
 }
@@ -1186,6 +1226,8 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
 spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
@@ -1230,6 +1272,9 @@ if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
 fi
 if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
     python3 /opt/glm53/patch_hybrid_prefix_hit.py
+fi
+if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
+    python3 /opt/glm53/patch_apc_per_group_retention.py
 fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
@@ -1284,6 +1329,8 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
 spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
@@ -1327,6 +1374,9 @@ fi
 if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
     python3 /opt/glm53/patch_hybrid_prefix_hit.py
 fi
+if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
+    python3 /opt/glm53/patch_apc_per_group_retention.py
+fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
 fi
@@ -1365,6 +1415,7 @@ _tp4_scp_runtime() {
     scp -q -o BatchMode=yes "$SCHED_PATCH_HOST" "${ssh_t}:/tmp/patch_scheduler_decode_floor.py"
     scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${ssh_t}:/tmp/patch_glm5_drafter_group.py"
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${ssh_t}:/tmp/patch_hybrid_prefix_hit.py"
+    scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${ssh_t}:/tmp/patch_apc_per_group_retention.py"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${ssh_t}:/tmp/patch_xgrammar_termination.py"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${ssh_t}:/tmp/patch_kpool_tail_slotmap.py"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
@@ -1453,6 +1504,22 @@ TP4_SKIP_OLD_SCP
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$GLM53_APC_RETENTION_INTERVAL")
+        log "global prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL} (all ranks)"
+    fi
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
+        log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (all ranks)"
+    fi
+    if [ -n "${NCCL_NCHANNELS:-}" ]; then
+        [[ "$NCCL_NCHANNELS" =~ ^[1-9][0-9]*$ ]] || die "NCCL_NCHANNELS must be a positive integer (got ${NCCL_NCHANNELS})"
+        nccl_common+=(
+            -e "NCCL_MIN_NCHANNELS=$NCCL_NCHANNELS"
+            -e "NCCL_MAX_NCHANNELS=$NCCL_NCHANNELS"
+        )
+        log "NCCL channels pinned MIN=MAX=${NCCL_NCHANNELS} (all ranks)"
+    fi
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
         [ "$e" = "-e" ] && continue
@@ -1473,7 +1540,7 @@ TP4_SKIP_OLD_SCP
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
-             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+             KV_CACHE_DTYPE LOAD_FORMAT PREFIX_MATCH_UNIT MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
@@ -1516,6 +1583,7 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro' \
             -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
             -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
+            -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
             -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
             -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
@@ -1550,6 +1618,7 @@ TP4_SKIP_OLD_SCP
         -v "$SCHED_PATCH_HOST:/opt/glm53/patch_scheduler_decode_floor.py:ro" \
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
+        -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
@@ -1570,7 +1639,10 @@ TP4_SKIP_OLD_SCP
         -e MAX_MODEL_LEN="$MAX_MODEL_LEN" -e GPU_MEM_UTIL="$GPU_MEM_UTIL" \
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
-        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
+        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" \
+        -e LOAD_FORMAT="${LOAD_FORMAT:-}" \
+        -e PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}" \
+        -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
         -e DFLASH_MODEL_DIR="${DFLASH_MODEL_DIR:-}" \

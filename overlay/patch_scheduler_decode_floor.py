@@ -39,9 +39,9 @@ GLM53_MIXED_PREFILL_CHUNK:
 
 Fair knobs (read at runtime; identical on every rank):
   GLM53_FAIR_PREFILL_CHUNK            default 256 (probe size until timing samples exist)
-  GLM53_FAIR_PREFILL_SHARE            default 0.20 (credit accrual fraction)
+  GLM53_FAIR_PREFILL_SHARE            default 0.30 (credit accrual fraction)
   GLM53_FAIR_PREFILL_MAX_INTERVAL_MS  default 2000
-  GLM53_FAIR_PREFILL_MAX_STEP_MS      default 1000 (estimated mixed-step limit)
+  GLM53_FAIR_PREFILL_MAX_STEP_MS      default 2000 (estimated mixed-step limit)
   GLM53_FAIR_PREFILL_MAX_CHUNKS       default 1
 
 Versioned installer: `# [glm53-decode-floor:v5]`. v1 (no version), v2, v3
@@ -320,9 +320,9 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
         if self.chunk <= 0:
             self.chunk = 256
         try:
-            self.share = float(self._e("GLM53_FAIR_PREFILL_SHARE", "0.20"))
+            self.share = float(self._e("GLM53_FAIR_PREFILL_SHARE", "0.30"))
         except ValueError:
-            self.share = 0.20
+            self.share = 0.30
         self.share = min(1.0, max(0.0, self.share))
         try:
             self.interval_s = int(self._e("GLM53_FAIR_PREFILL_MAX_INTERVAL_MS", "2000")) / 1000.0
@@ -336,9 +336,9 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
             self.max_chunks = 1
         self.max_chunks = max(1, min(self.max_chunks, 16))
         try:
-            self.max_step_s = max(0.001, int(self._e("GLM53_FAIR_PREFILL_MAX_STEP_MS", "1000")) / 1000.0)
+            self.max_step_s = max(0.001, int(self._e("GLM53_FAIR_PREFILL_MAX_STEP_MS", "2000")) / 1000.0)
         except ValueError:
-            self.max_step_s = 1.0
+            self.max_step_s = 2.0
         if self.mode == "fair" and not self.logged_boot:
             print(
                 f"[glm53-decode-floor] fair v5 probe_chunk={self.chunk} "
@@ -953,7 +953,7 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
-def _strip_helper(text: str, label: str) -> str:
+def _strip_helper(text: str, label: str, *, expected: str | None = None) -> str:
     start = text.find("class _Glm53MixedPrefill:")
     if start < 0:
         raise SystemExit(f"{P}: {label} helper start not found")
@@ -965,6 +965,8 @@ def _strip_helper(text: str, label: str) -> str:
     if not candidates:
         raise SystemExit(f"{P}: {label} helper end not found")
     end = min(candidates)
+    if expected is not None and text[start:end].strip() != expected.strip():
+        raise SystemExit(f"{P}: {label} helper drifted")
     return text[:start] + text[end:]
 
 
@@ -1063,7 +1065,7 @@ V5_PAIRS = tuple((new.replace(MARK_V4, MARK_V5), old, label) for new, old, label
 def unpatch_v5(text: str) -> str:
     for new, old, label in V5_PAIRS:
         text = replace_once(text, new, old, label)
-    text = _strip_helper(text, "v5")
+    text = _strip_helper(text, "v5", expected=_helper_text())
     if MARK_V5 in text:
         raise SystemExit(f"{P}: v5 leftover after unpatch")
     return text
@@ -1087,9 +1089,17 @@ def main() -> int:
     original = text
     if MARK_V5 in text:
         # Validate existing anchors/helper instead of trusting the marker alone.
-        clean = unpatch_v5(text)
-        if apply_v5(clean) != text:
-            raise SystemExit(f"{P}: v5 helper drifted")
+        # unpatch_v5 checks every v5 insertion occurs exactly once, strips the
+        # helper, and rejects leftover markers. The result is discarded: a
+        # later overlay may legitimately sit between the helper and the
+        # cuda_graph import anchor, so re-applying at that fixed anchor would
+        # relocate the helper and fail a byte-compare on a healthy file.
+        unpatch_v5(text)
+        # The import edit is part of the applied state; the byte-compare used
+        # to cover it implicitly.
+        if "import os\n" not in text.split("import time\n", 1)[0]:
+            raise SystemExit(f"{P}: v5 import drifted")
+        compile(text, str(P), "exec")
         print(f"{P.name}: {MARK_V5} already present — verified")
         return 0
     if MARK_V4 in text:

@@ -17,3 +17,6 @@ __pycache__/
 
 # bench artifacts (prefix-cache runs write here)
 results/
+
+# Cooperative MoE native artifacts are staged, not committed.
+extensions/cooperative_moe/*.so

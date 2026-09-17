@@ -17,7 +17,8 @@
 #
 # What we do:
 #   1. preflight  — docker/ssh/disk on both nodes
-#   2. image      — docker pull IMAGE from GHCR (public :exl3 tag). If the
+#   2. image      — docker pull IMAGE from GHCR (public :exl3-instanttensor
+#                   tag). If the
 #                   worker is missing that digest, try docker pull there,
 #                   then fall back to docker save --platform | ssh docker
 #                   load (issue #8). SKIP_PULL=1 keeps a local copy.
@@ -79,6 +80,10 @@ set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 set +a
+# Stock o_proj unless the caller exported ABLIT. Only this flag is cleared;
+# every other .env knob stays, including GLM53_APC_RETENTION_INTERVAL_SWA
+# from #207. Use ABLIT=1 ./start.sh to opt in.
+ABLIT=0
 # Each entry is NAME=value; quoting preserves whitespace and empty values.
 # shellcheck disable=SC2163
 for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do export "$_kv"; done
@@ -119,7 +124,7 @@ case "$GLM53_MODEL_PRESET" in
         exit 2
         ;;
 esac
-IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
@@ -139,6 +144,9 @@ WORKER_CX7_IF="${WORKER_CX7_IF:-enp1s0f0np0}"
 HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Empty = let NCCL pick the channel count. A positive integer pins both
+# NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS on both ranks (Entrpi 2× Spark: 8).
+NCCL_NCHANNELS="${NCCL_NCHANNELS:-}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
 # that node's own fabric IP. Most pairs share a good index; some do not (this kit
@@ -226,6 +234,16 @@ DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Direct-I/O safetensors on the published InstantTensor image. Unset follows
+# IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
+# PREFIX_MATCH_UNIT empty = vLLM default hash grain.
+if [ -z "${LOAD_FORMAT+x}" ]; then
+    case "$IMAGE" in
+        *instanttensor*) LOAD_FORMAT=instanttensor ;;
+        *) LOAD_FORMAT= ;;
+    esac
+fi
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
@@ -340,9 +358,9 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # prompt step-bounded newcomer probe, bounded contention credit, decode first.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
 GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
-GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.30}"
 GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
-GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-2000}"
 GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
 GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
@@ -367,6 +385,10 @@ GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 # Dense projections FP8 weight-only via Marlin (overlay/patch_dense_fp8.py). off = BF16 as shipped.
 # PROVISIONAL (changes target numerics; needs a KLD panel). Groups: shared,dense,kda,mla.
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
+# Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
+# Empty uses the adapter default (1). Must be identical on both ranks and set
+# before native prepare / CUDA-graph capture; it is not a live graph switch.
+GLM53_COOP_GEOMETRY="${GLM53_COOP_GEOMETRY:-}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # 1 = honour the per-request GPU prefix-cache no-store flag
@@ -636,6 +658,9 @@ validate_numeric_config() {
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
+    if [ -n "${GLM53_COOP_GEOMETRY:-}" ]; then
+        _glm53_validate_enum GLM53_COOP_GEOMETRY "$GLM53_COOP_GEOMETRY" 0 1 2 || return
+    fi
 }
 # GLM53 numeric config guard (end)
 
@@ -698,7 +723,7 @@ validate_overlay_artifacts() {
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
-    local entry path rest tag tail last
+    local entry path rest tag tail last stock_last
     if [ "${#artifacts[@]}" -eq 0 ]; then
         echo "overlay artifact list is empty - refusing to launch" >&2
         return 2
@@ -724,8 +749,24 @@ validate_overlay_artifacts() {
         # which must surface as the rc=2 diagnostic below, not a bare exit 1.
         last="$(grep -v '^[[:space:]]*$' "$path" | tail -n 1 || true)"
         if [ "$last" != "$tail" ]; then
-            echo "overlay artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
-            return 2
+            # Generated cooperative overlay appends an install footer after stock
+            # Exl3Config. Still require the stock closer in the body so a truncated
+            # copy cannot hide behind the footer.
+            if [ "$path" = "$EXL3_OVERLAY_HOST" ] && [[ "$last" == _coop_setup\[\"install\"\]* ]]; then
+                stock_last="$(python3 -c 'import sys
+p=[ln.rstrip("\n") for ln in open(sys.argv[1], encoding="utf-8")]
+while p and (not p[-1].strip() or p[-1].startswith("_coop_") or p[-1].startswith("import runpy as _coop") or p[-1].startswith("import sys as _coop") or p[-1].startswith("# Explicit fixed cooperative")):
+    p.pop()
+print(p[-1] if p else "")
+' "$path")"
+                if [ "$stock_last" != "$tail" ]; then
+                    echo "overlay artifact $path cooperative footer is present but stock closer is '$stock_last' (truncated copy?)" >&2
+                    return 2
+                fi
+            else
+                echo "overlay artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
+                return 2
+            fi
         fi
         # Parse-only: proves the file is importable Python without executing it
         # or leaving __pycache__ litter in the checkout.
@@ -1229,7 +1270,7 @@ pull_image() {
     log "pulling ${IMAGE} ..."
     docker pull "$IMAGE" && return 0
     die "docker pull ${IMAGE} failed.
-  :exl3 is a public GHCR package — check network / disk.
+  :exl3-instanttensor is a public GHCR package — check network / disk.
   If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
   Overlay rebuild: BUILD=1 ./start.sh. Recipe-stamp drift also rebuilds; SKIP_BUILD=1 keeps GHCR."
 }
@@ -1641,6 +1682,8 @@ ARGS=(
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1719,6 +1762,8 @@ ARGS=(
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1767,6 +1812,45 @@ EOF
     chmod +x "$HEAD_SCRIPT" "$WORKER_SCRIPT"
 }
 
+_glm53_coop_overlay_selected() {
+    local last
+    [ -f "$EXL3_OVERLAY_HOST" ] || return 1
+    last="$(grep -v '^[[:space:]]*$' "$EXL3_OVERLAY_HOST" | tail -n 1 || true)"
+    [[ "$last" == _coop_setup\[\"install\"\]* ]]
+}
+
+_glm53_coop_src_dir() {
+    local dir
+    dir="$(dirname -- "$EXL3_OVERLAY_HOST")"
+    if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    dir="$CACHE_ROOT/cooperative_moe"
+    if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    return 1
+}
+
+# Generated overlay run_path's /root/.cache/vllm/cooperative_moe/runtime.py.
+# Copy adapter + .so into the worker host cache that is bind-mounted there.
+_glm53_stage_coop_runtime_worker() {
+    local src dest
+    _glm53_coop_overlay_selected || return 0
+    src="$(_glm53_coop_src_dir)" || die "cooperative overlay $EXL3_OVERLAY_HOST needs runtime.py and cooperative_moe.so beside it or in $CACHE_ROOT/cooperative_moe"
+    mkdir -p "$CACHE_ROOT/cooperative_moe"
+    if [ "$src" != "$CACHE_ROOT/cooperative_moe" ]; then
+        install -m 644 "$src/runtime.py" "$src/cooperative_moe.so" "$CACHE_ROOT/cooperative_moe/"
+        src="$CACHE_ROOT/cooperative_moe"
+    fi
+    dest="$WORKER_VLLM_CACHE/cooperative_moe"
+    worker_ssh "mkdir -p '$dest'"
+    scp -q -o BatchMode=yes "$src/runtime.py" "$src/cooperative_moe.so" "${WORKER_SSH}:${dest}/"
+    log "cooperative MoE runtime staged on worker (${dest})"
+}
+
 # ------------------------------- launch ------------------------------------
 launch_cluster() {
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
@@ -1808,6 +1892,7 @@ launch_cluster() {
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
+    _glm53_stage_coop_runtime_worker
 
     worker_ssh "rm -rf /tmp/glm53-ablit"
     scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${WORKER_SSH}:/tmp/glm53-ablit"
@@ -1859,6 +1944,14 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    if [ -n "${NCCL_NCHANNELS:-}" ]; then
+        [[ "$NCCL_NCHANNELS" =~ ^[1-9][0-9]*$ ]] || die "NCCL_NCHANNELS must be a positive integer (got ${NCCL_NCHANNELS})"
+        nccl_common+=(
+            -e "NCCL_MIN_NCHANNELS=$NCCL_NCHANNELS"
+            -e "NCCL_MAX_NCHANNELS=$NCCL_NCHANNELS"
+        )
+        log "NCCL channels pinned MIN=MAX=${NCCL_NCHANNELS} (both ranks)"
+    fi
     log "per-request prefix-cache no-store flag: GLM53_APC_NO_STORE=${GLM53_APC_NO_STORE} (both ranks)"
     log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"
     # Global sparse retention is implemented by the pinned vLLM runtime.  Full
@@ -1897,7 +1990,7 @@ launch_cluster() {
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              LONG_PREFILL_TOKEN_THRESHOLD \
-             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_SAMPLE DFLASH_MODEL_DIR \
+             KV_CACHE_DTYPE LOAD_FORMAT PREFIX_MATCH_UNIT MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_SAMPLE DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB \
@@ -1906,7 +1999,8 @@ launch_cluster() {
              DEFAULT_MAX_NEW_TOKENS MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
-             GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
+             GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
+             GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2050,7 +2144,10 @@ launch_cluster() {
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
         -e DEFAULT_MAX_NEW_TOKENS="$DEFAULT_MAX_NEW_TOKENS" \
         -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}" \
-        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
+        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" \
+        -e LOAD_FORMAT="${LOAD_FORMAT:-}" \
+        -e PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}" \
+        -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
         -e DFLASH_SAMPLE="${DFLASH_SAMPLE:-probabilistic}" \
@@ -2085,6 +2182,7 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e VLLM_API_KEY \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \

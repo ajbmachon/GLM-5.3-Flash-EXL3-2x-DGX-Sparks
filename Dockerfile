@@ -450,6 +450,7 @@ COPY overlay/patch_suppress_stops_in_reasoning.py /opt/glm53/patch_suppress_stop
 COPY tests/test_suppress_stops.py /opt/glm53/test_suppress_stops.py
 COPY overlay/patch_scheduler_decode_floor.py /opt/glm53/patch_scheduler_decode_floor.py
 COPY tests/test_scheduler_decode_floor.py /opt/glm53/test_scheduler_decode_floor.py
+COPY tests/test_scheduler_decode_floor_restart.py /opt/glm53/test_scheduler_decode_floor_restart.py
 COPY overlay/patch_hybrid_prefix_hit.py /opt/glm53/patch_hybrid_prefix_hit.py
 COPY overlay/patch_apc_per_group_retention.py /opt/glm53/patch_apc_per_group_retention.py
 COPY tests/test_apc_per_group_retention.py /opt/glm53/test_apc_per_group_retention.py
@@ -512,6 +513,7 @@ RUN python3 /opt/glm53/patch_ablit.py
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_suppress_stops.py \
     && python3 /opt/glm53/test_scheduler_decode_floor.py \
+    && python3 /opt/glm53/test_scheduler_decode_floor_restart.py \
     && python3 /opt/glm53/test_hybrid_prefix_hit.py \
     && python3 /opt/glm53/test_xgrammar_termination.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
@@ -519,6 +521,11 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_ablit.py \
     && python3 /opt/glm53/test_cache_reset_endpoint.py
+
+# Direct-I/O safetensors loader. --no-deps: a normal pip install pulls
+# nvidia-nccl-cu13==2.29.7 over this image's NCCL 2.30.7.
+RUN pip install --no-deps --no-cache-dir instanttensor==0.2.0 \
+    && python3 -c "import instanttensor; print('instanttensor', instanttensor.__file__)"
 
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.
